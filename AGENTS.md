@@ -8,6 +8,12 @@ thread per agent. There are no dependencies, no build step, and no
 server. The CLI never calls a model; the LLM is the manager agent
 running it (see "Compaction" below).
 
+This repo is also a portable [Agent Skill](https://agentskills.io):
+`SKILL.md` at the root carries the spec frontmatter (`name`,
+`description`, `compatibility`, `metadata`) plus the condensed
+workflows an agent follows when the skill is active. This file is the
+full reference behind it; `README.md` is the human-facing overview.
+
 ## Runtime
 
 - **Node.js 22+ is the default.** The shebang is `#!/usr/bin/env node`,
