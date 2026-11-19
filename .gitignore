@@ -1,0 +1,6 @@
+# Runtime project state created by `fleet init` (see AGENTS.md).
+# Projects live alongside fleet.ts by default and are per-machine
+# state, not repo content. Ignore every top-level directory; repo
+# files live at the top level. To add an intentional directory later,
+# use `git add -f <dir>`.
+/*/
