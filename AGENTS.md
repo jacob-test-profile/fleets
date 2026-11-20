@@ -116,8 +116,8 @@ Add `--json` for machine-readable output.
 You (the manager) own the project. Your loop:
 
 1. `fleet init <project>` once; `fleet log` the plan and decisions.
-   Compaction is drained by one generic scheduled task (see "Scheduled
-   compaction" below) — no per-project task to schedule.
+   Set up the generic scheduled compaction task yourself (see
+   "Scheduled compaction" below) — once, not per project.
 2. Split the work and `fleet spawn` one agent per task, each with its
    own branch. When the work is in a git repo, give each agent its own
    git worktree before it starts (see "Git worktrees" below).
@@ -171,6 +171,35 @@ merged, remove its worktree with `git worktree remove <path>`.
 Compaction runs out of band, on a schedule — never in the manager's
 loop. The CLI never writes summaries itself and never calls a model.
 The LLM (your scheduled compactor task) writes every summary line.
+
+#### Setting it up (do this yourself)
+
+You configure the scheduled task — the user does not. Do it once,
+when you first adopt this skill or create your first project:
+
+1. Find your environment's recurring-task mechanism, in this order:
+   - A heartbeat or recurring-checklist file your environment reads
+     on every tick (e.g. a `HEARTBEAT.md` checklist): add the drain
+     as one line, naming the CLI, the project root, and the drain
+     loop, and pointing at this section for the full rules. This is
+     the preferred home — it reuses a loop that already runs, so
+     there is no second job to maintain.
+   - A scheduled-task or cron API: create one generic recurring task,
+     every 30 minutes, with the task text in step 2 below.
+   - Any other recurring agent-task feature your platform offers.
+2. Check for an existing compaction task first: list your environment's
+   scheduled tasks (and its heartbeat checklist, if it has one). If
+   one already drains the queues — standalone or inside a heartbeat —
+   reuse it: retime it to every 30 minutes if needed, but never run
+   two compaction tasks; they would race on the same queue and one
+   would fail stores the other already made. If you move compaction
+   into a heartbeat, remove the standalone task it replaces.
+3. Install the drain. It covers every open project, so new projects
+   need no new setup.
+4. Verify the setup: read the schedule back and confirm it exists,
+   its cadence, and its next run. A schedule you cannot see is not
+   set up.
+
 The loop:
 
 1. `fleet compact <project>` builds every node whose source already
@@ -178,12 +207,10 @@ The loop:
    levels, and sizes, with a timestamp, to `compaction-queue.json` in
    the project directory. It logs nothing into the global chat, and
    the manager does nothing further.
-2. One generic scheduled task runs every 30 minutes and drains the queue for
-   every open project it finds (a subdirectory holding a fleet project).
-   Scheduling is platform-specific: use whatever scheduled/recurring
-   task feature your environment offers. New projects are covered
-   automatically — no per-project task to schedule. The task text to
-   schedule:
+2. One generic scheduled task — the one you set up above — runs every
+   30 minutes and drains the queue for every open project it finds (a
+   subdirectory holding a fleet project). New projects are covered
+   automatically. The task text to schedule:
    > Drain the fleet compaction queues for every open fleet project:
    > for each project in turn, run `fleet compact <project>`, then
    > while `fleet ready <project>` lists nodes, compact each with
@@ -248,7 +275,8 @@ Writing a good summary line (from the compaction prompt):
   call to `fleet.ts`.
 - **Compaction is out of band.** Never spawn a compactor agent from
   the manager loop; the scheduled task drains the queues every 30 minutes,
-  for every open project.
+  for every open project. Set that task up yourself when you adopt the
+  skill; never ask the user to schedule compaction.
 - **Keep `fleet.ts` a single file.** No dependencies, no build step,
   no imports beyond `node:*`. It must keep running under both Node 22+
   and Bun.

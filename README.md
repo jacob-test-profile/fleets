@@ -98,7 +98,9 @@ end with the most detail on the newest messages. Nodes are addressed as
 `id+n`: the `n` messages from `id` on (`0+4` covers messages 0-3).
 `compact` builds every node whose source already fits; for the rest it
 logs the refs to `compaction-queue.json`, and a scheduled compactor task
-drains the queue out of band with `ready --one` and `store-node`.
+drains the queue out of band with `ready --one` and `store-node`. The
+agent sets that task up itself when it adopts the skill — no manual
+scheduling, and one task covers every project.
 
 By default projects live next to `fleet.ts` (override with `--root` or
 `$FLEET_ROOT`). They are per-machine runtime state and are git-ignored.

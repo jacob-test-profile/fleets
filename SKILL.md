@@ -77,8 +77,8 @@ and work dirs.
 You (the manager) own the project:
 
 1. `fleet.ts init <project>` once; `fleet.ts log` the plan and
-   decisions. Compaction is drained by one generic scheduled task (see
-   "Scheduled compaction" below) — no per-project task to schedule.
+   decisions. Set up the generic scheduled compaction task yourself
+   (see "Scheduled compaction" below) — once, not per project.
 2. Split the work and `fleet.ts spawn` one agent per task, each with
    its own branch. `spawn` returns the agent's name at once. When the
    work is in a git repo, give each agent its own git worktree before
@@ -120,6 +120,29 @@ Compaction runs out of band, on a schedule — never in the manager's
 loop. The CLI never writes summaries itself and never calls a model.
 The LLM (your scheduled compactor task) writes every summary line.
 
+### Setting it up (do this yourself)
+
+You configure the scheduled task — the user does not. Do it once,
+when you first adopt this skill or create your first project:
+
+1. Find your environment's recurring-task mechanism, in this order:
+   - A heartbeat or recurring-checklist file your environment reads
+     on every tick (e.g. a `HEARTBEAT.md` checklist): add the drain
+     as one line. This is the preferred home — it reuses a loop that
+     already runs.
+   - A scheduled-task or cron API: create one generic recurring task,
+     every 30 minutes, with the task text below.
+   - Any other recurring agent-task feature your platform offers.
+2. Check for an existing compaction task first. If one already runs —
+   standalone or inside a heartbeat — reuse it: retime it to every 30
+   minutes if needed, but never run two compaction tasks; they would
+   race on the same queue. If you move compaction into a heartbeat,
+   remove the standalone task it replaces.
+3. Install the drain with the task text below. It covers every open
+   project, so new projects need no new setup.
+4. Verify the setup: confirm the schedule exists and note its next
+   run. A schedule you cannot see is not set up.
+
 How it works:
 
 1. `fleet.ts compact <project>` builds every node whose source already
@@ -127,12 +150,11 @@ How it works:
    the project directory: the pending refs, their levels, and sizes,
    with a timestamp. It logs nothing into the global chat, and the
    manager does nothing further.
-2. One generic scheduled task runs every 30 minutes and drains the queue for
-   every open project it finds (a subdirectory holding a fleet project).
-   Scheduling is platform-specific: use whatever scheduled/recurring task
-   feature your environment offers. The task runs on its own; the manager
-   never blocks on compaction and never spawns a compactor inline. New
-   projects are covered automatically — no per-project task to schedule.
+2. One generic scheduled task — the one you set up above — runs every
+   30 minutes and drains the queue for every open project it finds (a
+   subdirectory holding a fleet project). The task runs on its own;
+   the manager never blocks on compaction and never spawns a compactor
+   inline. New projects are covered automatically.
 3. Each run of the scheduled task, for each open project in turn:
    - Run `fleet.ts compact <project>` to refresh the queue.
    - While `fleet.ts ready <project>` lists nodes, take one with
@@ -212,7 +234,8 @@ clip it: there is no truncation path, by design.
   scheduled compactor.
 - Compaction is out of band. Never spawn a compactor agent from the
   manager loop; the scheduled task drains the queues every 30 minutes, for
-  every open project.
+  every open project. Set that task up yourself when you adopt the skill;
+  never ask the user to schedule compaction.
 - Keep `fleet.ts` a single file. No dependencies, no build step, no
   imports beyond `node:*`. It must keep running under both Node 22+
   and Bun.
