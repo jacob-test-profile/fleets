@@ -17,9 +17,10 @@ messages at full detail and older ones in broader merged lines, so the
 whole history stays readable at any size.
 
 The CLI never calls a model. When a summary needs real compression, it
-logs the node to the compaction queue, and a scheduled compactor task
-writes the line out of band, every 30 minutes. There is no truncation
-fallback: a line either fits in 512 bytes or gets rewritten by the LLM.
+logs the node to the compaction queue, and one generic scheduled compactor
+task writes the lines out of band, every hour, for every open project.
+There is no truncation fallback: a line either fits in 512 bytes or gets
+rewritten by the LLM.
 
 ## Requirements
 

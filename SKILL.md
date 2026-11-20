@@ -77,10 +77,16 @@ and work dirs.
 You (the manager) own the project:
 
 1. `fleet.ts init <project>` once; `fleet.ts log` the plan and
-   decisions. Schedule the project's recurring compaction task (see
-   "Scheduled compaction" below) — once per project.
+   decisions. Compaction is drained by one generic scheduled task (see
+   "Scheduled compaction" below) — no per-project task to schedule.
 2. Split the work and `fleet.ts spawn` one agent per task, each with
-   its own branch. `spawn` returns the agent's name at once.
+   its own branch. `spawn` returns the agent's name at once. When the
+   work is in a git repo, give each agent its own git worktree before
+   it starts: `git worktree add <path> <branch>` (one per agent; the
+   manager's checkout stays on the main branch). All agents share one
+   filesystem, so a shared working directory means branch switches and
+   stray files collide — a worktree per agent is what makes "one
+   agent, one branch" real.
 3. Check in with `fleet.ts status` and `fleet.ts view`. Read agent
    reports as they land in the global chat; send follow-ups with
    `fleet.ts tell`.
@@ -99,7 +105,10 @@ A spawned agent's loop:
 2. Read project context with `fleet.ts view <project>`, zooming into
    anything your task depends on before acting.
 3. Do the work in your own directory, `work/<YourName>/`, on your own
-   branch. Do not touch another agent's work dir or thread.
+   branch. Do not touch another agent's work dir or thread. When the
+   project is a git repo, your directory is a git worktree on your
+   branch — never check out another branch there, and never work in
+   the manager's checkout.
 4. When finished (or blocked), `fleet.ts report <project> <YourName>
    --text <report> [--done]`. The report is your final word: what you
    did, what you found, what failed. The manager reads it as a `work`
@@ -118,12 +127,13 @@ How it works:
    the project directory: the pending refs, their levels, and sizes,
    with a timestamp. It logs nothing into the global chat, and the
    manager does nothing further.
-2. Once per project, schedule a recurring task every 30 minutes to
-   drain the queue (below). Scheduling is platform-specific: use
-   whatever scheduled/recurring task feature your environment offers.
-   The task runs on its own; the manager never blocks on compaction
-   and never spawns a compactor inline.
-3. Each run of the scheduled task:
+2. One generic scheduled task runs every hour and drains the queue for
+   every open project it finds (a subdirectory holding a fleet project).
+   Scheduling is platform-specific: use whatever scheduled/recurring task
+   feature your environment offers. The task runs on its own; the manager
+   never blocks on compaction and never spawns a compactor inline. New
+   projects are covered automatically — no per-project task to schedule.
+3. Each run of the scheduled task, for each open project in turn:
    - Run `fleet.ts compact <project>` to refresh the queue.
    - While `fleet.ts ready <project>` lists nodes, take one with
      `fleet.ts ready <project> --one <id+n>`. The output is the full
@@ -143,15 +153,15 @@ How it works:
 4. `fleet.ts status <project>` shows the queue state: how many nodes
    are waiting and when the queue was last logged.
 
-Task text to schedule (one per project, every 30 minutes):
+Task text to schedule (one generic task, every hour, over all open projects):
 
-> Drain the fleet compaction queue for project `<project>`: run
-> `fleet.ts compact <project>`, then while `fleet.ts ready <project>`
-> lists nodes, compact each with `fleet.ts ready <project> --one
-> <id+n>` and `fleet.ts store-node <project> <id+n> --text <line>`
-> (one line, at most 512 bytes), until `fleet.ts ready` is empty.
-> Finish with `fleet.ts compact <project>` to confirm. If nothing is
-> pending, exit quietly.
+> Drain the fleet compaction queues for every open fleet project: for
+> each project in turn, run `fleet.ts compact <project>`, then while
+> `fleet.ts ready <project>` lists nodes, compact each with
+> `fleet.ts ready <project> --one <id+n>` and `fleet.ts store-node
+> <project> <id+n> --text <line>` (one line, at most 512 bytes), until
+> `fleet.ts ready` is empty. Finish with `fleet.ts compact <project>`
+> to confirm. If nothing is pending, exit quietly.
 
 Writing a good summary line: output only the line, without an `id+n|`
 head. One line: no newlines. Keep user words closest to verbatim; then
@@ -190,15 +200,19 @@ clip it: there is no truncation path, by design.
   `fleet.ts zoom` to the detail you need.
 - Append-only. Correct a mistake with a new message, not by rewriting
   history.
-- One agent, one task, one branch. Agents write only to their own
-  thread and work dir, and report through `fleet.ts report`.
+- One agent, one task, one branch, one worktree. Agents write only to
+  their own thread and work dir, and report through `fleet.ts report`.
+  When the work is in a git repo, each agent gets its own git worktree
+  (`git worktree add <path> <branch>`) before it starts; the manager's
+  checkout stays on the main branch.
 - Reports are the interface. A finished task without a report is
   unfinished.
 - No truncation, no model calls in the CLI. If a summary line does not
   fit, rewrite it. If a node needs intelligence, it waits for the
   scheduled compactor.
 - Compaction is out of band. Never spawn a compactor agent from the
-  manager loop; the scheduled task drains the queue every 30 minutes.
+  manager loop; the scheduled task drains the queues every hour, for
+  every open project.
 - Keep `fleet.ts` a single file. No dependencies, no build step, no
   imports beyond `node:*`. It must keep running under both Node 22+
   and Bun.

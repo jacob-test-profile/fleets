@@ -116,10 +116,11 @@ Add `--json` for machine-readable output.
 You (the manager) own the project. Your loop:
 
 1. `fleet init <project>` once; `fleet log` the plan and decisions.
-   Schedule the project's recurring compaction task (see "Scheduled
-   compaction" below) — once per project.
+   Compaction is drained by one generic scheduled task (see "Scheduled
+   compaction" below) — no per-project task to schedule.
 2. Split the work and `fleet spawn` one agent per task, each with its
-   own branch.
+   own branch. When the work is in a git repo, give each agent its own
+   git worktree before it starts (see "Git worktrees" below).
 3. Check in with `fleet status` and `fleet view`. Read agent reports
    as they land in the global chat; send follow-ups with `fleet tell`.
 4. After a batch of activity, run `fleet compact`. It builds what fits
@@ -136,11 +137,34 @@ A spawned agent's loop:
 2. Read project context with `fleet view <project>`, zooming into
    anything your task depends on before acting.
 3. Do the work in your own directory, `work/<YourName>/`, on your own
-   branch. Do not touch another agent's work dir or thread.
+   branch. Do not touch another agent's work dir or thread. When the
+   project is a git repo, your directory is a git worktree on your
+   branch — never check out another branch there, and never work in
+   the manager's checkout.
 4. When finished (or blocked), `fleet report <project> <YourName>
    --text <report> [--done]`. The report is your final word: what you
    did, what you found, what failed. The manager reads it as a `work`
    message in the global chat.
+
+### Git worktrees
+
+All fleet agents share one filesystem, so a shared working directory
+is a collision waiting to happen: only one branch can be checked out
+at a time, and one agent's branch switch rewrites the files another
+agent is editing. When the work is in a git repo, each agent gets its
+own git worktree, set up by the manager before the agent starts:
+
+```
+git worktree add <path-per-agent> <branch>
+```
+
+One worktree per agent, one branch per worktree. The manager's own
+checkout stays on the main branch; the manager never checks out a
+worker's branch in its own directory. Untracked build dependencies
+(`node_modules/`, build output) are not shared between worktrees —
+copy them into each worktree once instead of reinstalling, or let the
+agent install them. When a worker's task is done and its branch is
+merged, remove its worktree with `git worktree remove <path>`.
 
 ### Scheduled compaction
 
@@ -154,19 +178,21 @@ The loop:
    levels, and sizes, with a timestamp, to `compaction-queue.json` in
    the project directory. It logs nothing into the global chat, and
    the manager does nothing further.
-2. Once per project, schedule a recurring task every 30 minutes to
-   drain the queue. Scheduling is platform-specific: use whatever
-   scheduled/recurring task feature your environment offers. The task
-   text to schedule:
-   > Drain the fleet compaction queue for project `<project>`: run
-   > `fleet compact <project>`, then while `fleet ready <project>`
-   > lists nodes, compact each with `fleet ready <project> --one
-   > <id+n>` and `fleet store-node <project> <id+n> --text <line>`
-   > (one line, at most 512 bytes), until `fleet ready` is empty.
-   > Finish with `fleet compact <project>` to confirm. If nothing is
-   > pending, exit quietly.
+2. One generic scheduled task runs every hour and drains the queue for
+   every open project it finds (a subdirectory holding a fleet project).
+   Scheduling is platform-specific: use whatever scheduled/recurring
+   task feature your environment offers. New projects are covered
+   automatically — no per-project task to schedule. The task text to
+   schedule:
+   > Drain the fleet compaction queues for every open fleet project:
+   > for each project in turn, run `fleet compact <project>`, then
+   > while `fleet ready <project>` lists nodes, compact each with
+   > `fleet ready <project> --one <id+n>` and `fleet store-node
+   > <project> <id+n> --text <line>` (one line, at most 512 bytes),
+   > until `fleet ready` is empty. Finish with `fleet compact
+   > <project>` to confirm. If nothing is pending, exit quietly.
 3. Each run starts with `fleet compact <project>` to refresh the
-   queue, then reads one task with
+   queue for that project, then reads one task with
    `fleet ready <project> --one <id+n>`. The output is the full
    compaction prompt: the ruler, the rules, recent view context, and
    the source to compress. `ready` derives the pending set live from
@@ -182,8 +208,9 @@ The loop:
    `compaction-queue.json`.
 5. The task repeats steps 3–4 until `fleet ready` is empty, then runs
    `fleet compact` once more to confirm the tree is clean and log the
-   empty queue. If the queue is empty it exits quietly: no report, no
-   message in the global chat. Compaction leaves no trace in the chat.
+   empty queue, then moves on to the next open project. If a queue is
+   empty it exits quietly for that project: no report, no message in
+   the global chat. Compaction leaves no trace in the chat.
    `fleet status` shows the queue state: how many nodes are waiting
    and when the queue was last logged.
 
@@ -208,8 +235,10 @@ Writing a good summary line (from the compaction prompt):
   `fleet zoom` to the detail you need.
 - **Append-only.** Messages and nodes are never edited or deleted.
   Correct a mistake with a new message, not by rewriting history.
-- **One agent, one task, one branch.** Agents write only to their own
-  thread and work dir, and report through `fleet report`.
+- **One agent, one task, one branch, one worktree.** Agents write only
+  to their own thread and work dir, and report through `fleet report`.
+  When the work is in a git repo, each agent gets its own git worktree
+  before it starts; the manager's checkout stays on the main branch.
 - **Reports are the interface.** The manager learns what an agent did
   only from its `work` message in the global chat. A finished task
   without a report is unfinished.
@@ -218,8 +247,8 @@ Writing a good summary line (from the compaction prompt):
   scheduled compactor. Do not add a truncation fallback or a model API
   call to `fleet.ts`.
 - **Compaction is out of band.** Never spawn a compactor agent from
-  the manager loop; the scheduled task drains the queue every 30
-  minutes.
+  the manager loop; the scheduled task drains the queues every hour,
+  for every open project.
 - **Keep `fleet.ts` a single file.** No dependencies, no build step,
   no imports beyond `node:*`. It must keep running under both Node 22+
   and Bun.
@@ -237,7 +266,7 @@ node fleet.ts view demo
 node fleet.ts report demo RedFox --text "Fixed redirect, added test, all green." --done
 node fleet.ts compact demo
 # compact logs what still needs the LLM to compaction-queue.json.
-# The scheduled compactor task (every 30 minutes) drains it:
+# The generic scheduled compactor task (every hour, every open project) drains it:
 node fleet.ts ready demo --one 6+1
 node fleet.ts store-node demo 6+1 --text "user: password reset emails carry a token expiring after one hour."
 node fleet.ts compact demo
