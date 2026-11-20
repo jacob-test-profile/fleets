@@ -4,12 +4,13 @@ description: >-
   Coordinate a fleet of coding agents with shared, durable memory using
   the fleet.ts CLI: one never-ending global chat per project, a binary
   summary tree with view and zoom for navigating history, one thread and
-  work directory per agent, and scheduled out-of-band compaction. Use when two
+  work directory per agent, scheduled out-of-band compaction, and a swarm
+  audit that reconciles fleet tasks with live agents. Use when two
   or more agents work on shared tasks, when project history must survive
   across sessions, or when a manager needs progress reports on demand.
 compatibility: Requires Node.js 22+ (or Bun) to run fleet.ts. No dependencies, no build step, no network access.
 metadata:
-  version: "0.3.0"
+  version: "0.4.0"
   author: jacob-test-profile
 ---
 
@@ -89,7 +90,9 @@ You (the manager) own the project:
    agent, one branch" real.
 3. Check in with `fleet.ts status` and `fleet.ts view`. Read agent
    reports as they land in the global chat; send follow-ups with
-   `fleet.ts tell`.
+   `fleet.ts tell`. When the user asks for status — on the whole swarm
+   or one task — audit instead of guessing: see "Auditing the swarm"
+   below.
 4. After a batch of activity, run `fleet.ts compact`. It builds what
    fits and logs the rest to the compaction queue; the scheduled
    compactor drains it out of band. Never spawn a compactor inline.
@@ -109,10 +112,11 @@ A spawned agent's loop:
    project is a git repo, your directory is a git worktree on your
    branch — never check out another branch there, and never work in
    the manager's checkout.
-4. When finished (or blocked), `fleet.ts report <project> <YourName>
-   --text <report> [--done]`. The report is your final word: what you
-   did, what you found, what failed. The manager reads it as a `work`
-   message in the global chat.
+4. When finished, `fleet.ts report <project> <YourName> --text
+   <report> --done`; when blocked, the same with `--blocked` instead,
+   so the manager sees it as blocked rather than idle. The report is
+   your final word: what you did, what you found, what failed. The
+   manager reads it as a `work` message in the global chat.
 
 ## Scheduled compaction
 
@@ -194,6 +198,36 @@ two rather than dropping it: an absent item can never be found again.
 If the CLI says the line is over the limit, rewrite it shorter. Do not
 clip it: there is no truncation path, by design.
 
+## Auditing the swarm
+
+When the user asks how things stand — the whole swarm or one task —
+answer from an audit, never from one source alone. The fleet's tasks
+and your platform's live agents can disagree: a task can sit
+`[working]` long after its agent is gone (a follow-up `tell` re-arms
+a finished task, for instance), and an agent can be running work no
+task tracks. The audit joins the two sides and tells you what to
+reconcile.
+
+1. List your platform's live agents and pass their names to the audit:
+   `fleet.ts audit <project> --live <Name1,Name2>`. Name each platform
+   subagent after its fleet agent, so the join works. The CLI cannot
+   see your platform's agents — without `--live` it reports fleet-side
+   state only.
+2. Read the findings: in progress (task `[working]` + live agent),
+   stale or stalled (`[working]` + no live agent), waiting (`[idle]` —
+   the agent reported and waits on you), blocked, unaccounted (live
+   agent, no task), done-but-live, orphaned threads, tasks without
+   threads, and bookkeeping mismatches.
+3. Reconcile — do not just report. For each finding, do the action the
+   audit prescribes: mark done what is done and merged (`report
+   --done`), nudge or re-spawn what is stalled (`tell`, or a fresh
+   `spawn`), follow up idle and blocked agents (`tell`), track
+   unaccounted agents (`spawn --name`) or close them, and run `audit
+   --fix` for the bookkeeping. An audit that ends in a report with no
+   action is unfinished: keep going until the swarm matches reality
+   and every open task has a live agent moving it toward the goal.
+4. Then answer the user's status question from the reconciled state.
+
 ## Commands
 
 | Command | When to use it |
@@ -204,10 +238,11 @@ clip it: there is no truncation path, by design.
 | `fleet.ts zoom <project> <id+n\|id\|Name>` | Drill down: open a summary line into its children, read one message whole, or read an agent's whole thread by name. |
 | `fleet.ts spawn <project> --task <t> [--name N] [--branch B]` | Start one agent thread per task, in parallel. |
 | `fleet.ts tell <project> <name> --message <m>` | Send a message to an agent thread. |
-| `fleet.ts report <project> <name> --text <t> [--done]` | Inject an agent's report into the global chat as a `[Name]` work message. |
+| `fleet.ts report <project> <name> --text <t> [--done\|--blocked]` | Inject an agent's report into the global chat as a `[Name]` work message. `--done` closes the task; `--blocked` marks it blocked. |
 | `fleet.ts status <project>` | The manager's dashboard: messages, view size, tree state, nodes waiting on the LLM, agents, tasks, recent lines. |
 | `fleet.ts agents <project>` | List agent threads with log lengths and status. |
 | `fleet.ts tasks <project>` | List tasks and their status. |
+| `fleet.ts audit <project> [--live <a,b>] [--fix]` | Join fleet tasks with your platform's live agents; report stale, waiting, blocked, and unaccounted work, with the commands to reconcile each. `--fix` applies the bookkeeping fixes. |
 | `fleet.ts compact <project>` | After logging a batch of work. Builds nodes whose source fits; logs the rest to the compaction queue for the scheduled compactor. |
 | `fleet.ts ready <project> [--one <id+n>]` | List nodes waiting on scheduled compaction. `--one` prints one node's full task. |
 | `fleet.ts store-node <project> <id+n> --text <line>` | Store one LLM-written summary line (at most 512 bytes). For the scheduled compactor. |
@@ -236,6 +271,11 @@ clip it: there is no truncation path, by design.
   manager loop; the scheduled task drains the queues every 30 minutes, for
   every open project. Set that task up yourself when you adopt the skill;
   never ask the user to schedule compaction.
+- Status questions get an audit. When the user asks how things stand —
+  the whole swarm or one task — run `fleet.ts audit` with the live
+  agent list, reconcile whatever is off, then answer from the
+  reconciled state. Never answer from the fleet state or the live
+  agents alone.
 - Keep `fleet.ts` a single file. No dependencies, no build step, no
   imports beyond `node:*`. It must keep running under both Node 22+
   and Bun.

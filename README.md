@@ -115,9 +115,10 @@ By default projects live next to `fleet.ts` (override with `--root` or
 | `zoom <project> <id+n\|id\|Name>` | Open a line, read a message, read an agent's thread |
 | `spawn <project> --task <t> [--name N] [--branch B]` | Start an agent thread |
 | `tell <project> <name> --message <m>` | Message an agent thread |
-| `report <project> <name> --text <t> [--done]` | Inject an agent's report into the global chat |
+| `report <project> <name> --text <t> [--done\|--blocked]` | Inject an agent's report into the global chat |
 | `status <project>` | Manager's dashboard |
 | `agents <project>` / `tasks <project>` | List threads / tasks |
+| `audit <project> [--live <a,b>] [--fix]` | Join fleet tasks with live agents; report stale, waiting, blocked, and unaccounted work, with the commands to reconcile it |
 | `compact <project>` | Build fitting nodes; log the rest to the compaction queue |
 | `ready <project> [--one <id+n>]` | List / read compaction tasks |
 | `store-node <project> <id+n> --text <line>` | Store one LLM-written summary line |
@@ -128,7 +129,7 @@ and text can come from `--text`, trailing words, `--file`, or stdin.
 
 ## Files
 
-- `fleet.ts` — the CLI. One file, ~1,210 lines, no dependencies.
+- `fleet.ts` — the CLI. One file, ~1,400 lines, no dependencies.
 - `SKILL.md` — the Agent Skill definition: frontmatter plus the
   workflow agents follow when the skill is active.
 - `AGENTS.md` — the full reference for agents working in this repo.

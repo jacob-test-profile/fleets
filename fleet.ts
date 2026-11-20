@@ -44,6 +44,7 @@
 //   node fleet.ts log demo --kind user --text "Ship the login fix"
 //   node fleet.ts spawn demo --task "Fix login redirect" --branch fix/login
 //   node fleet.ts status demo
+//   node fleet.ts audit demo --live RedFox,CalmOwl   (join tasks with live agents; --fix reconciles bookkeeping)
 //   node fleet.ts view demo
 //   node fleet.ts zoom demo 0+4
 //   node fleet.ts compact demo            (builds what fits, logs the rest to the queue)
@@ -93,7 +94,7 @@ const SLOT = 16;
 const DAY = 864e5;
 const CAP = 30000;
 const WAIT = "(not summarized yet: zoom it)";
-const VERSION = "fleet 0.3.0 (UniiChat-memory port, scheduled out-of-band compaction)";
+const VERSION = "fleet 0.4.0 (UniiChat-memory port, scheduled out-of-band compaction, swarm audit)";
 
 // ------------------------------------------------------------- names
 // Agent names: adjective + noun, e.g. FireAnt. Port of Names.ts.
@@ -866,11 +867,14 @@ Usage: fleet <command> [args] [--root <dir>] [--json]
   spawn <project> --task <t> [--name N] [--branch B]
                                         start an agent thread, print its name
   tell <project> <name> --message <m>   send a message to an agent thread
-  report <project> <name> --text <t> [--done]
+  report <project> <name> --text <t> [--done|--blocked]
                                         inject [Name] report into global chat
   status <project>                      counts, view size, agents, tasks, recent lines
   agents <project>                      list agent threads with log lengths
   tasks <project>                       list tasks
+  audit <project> [--live <a,b>] [--fix] join fleet tasks with live agents;
+                                        report stale, waiting, blocked, unaccounted
+                                        work, with the commands to reconcile it
   compact <project>                     build nodes whose source fits; log the rest
                                         to compaction-queue.json for the scheduled compactor
   ready <project> [--one <id+n>]        list nodes waiting on scheduled compaction
@@ -888,6 +892,15 @@ Scheduled compaction (out of band; the LLM is the scheduled task, not this CLI):
   3. it runs: fleet ready <project> --one <id+n>   (reads one task)
   4. it runs: fleet store-node <project> <id+n> --text <line>
   5. it repeats until the queue is empty, then re-runs fleet compact
+
+Auditing the swarm (the manager's reconciliation; see SKILL.md):
+  fleet audit <project> --live <Name1,Name2>   join tasks with live agents
+  --live takes the live agent names from your platform's agent list;
+  the CLI cannot see them itself. Without --live, audit reports
+  fleet-side state only. --fix applies the unambiguous bookkeeping
+  fixes (syncing the working list with the tasks). Judgement calls —
+  done vs stalled — stay with the manager: the audit prescribes the
+  commands, it does not decide.
 `;
 
 // --------------------------------------------------------- commands
@@ -987,6 +1000,8 @@ function cmdTell(root: string, pos: string[], opts: Opts): void {
   if (!message) fail("tell needs a message");
   const id = agentPush(dir, name, "user", message);
   setTaskStatus(dir, name, "working");
+  const mem = loadMemory(dir);
+  if (!mem.work.includes(name)) { mem.work = [...mem.work, name]; saveView(mem); }
   if (opts.json) outJson({ project, agent: name, id });
   else console.log("Sent to " + name + " (log line " + id + ").");
 }
@@ -1006,10 +1021,12 @@ function cmdReport(root: string, pos: string[], opts: Opts): void {
     setTaskStatus(dir, name, "done");
     mem.work = mem.work.filter((w) => w !== name);
     saveView(mem);
+  } else if (opts.blocked) {
+    setTaskStatus(dir, name, "blocked");
   } else {
     setTaskStatus(dir, name, "idle");
   }
-  if (opts.json) outJson({ project, agent: name, count: mem.count, done: opts.done === true });
+  if (opts.json) outJson({ project, agent: name, count: mem.count, done: opts.done === true, blocked: opts.blocked === true });
   else console.log("Reported [" + name + "] into the global chat (" + mem.count + " messages).");
 }
 
@@ -1081,6 +1098,171 @@ function cmdTasks(root: string, pos: string[], opts: Opts): void {
   if (opts.json) { outJson({ project, tasks }); return; }
   if (tasks.length === 0) { console.log("no tasks yet"); return; }
   for (const t of tasks) console.log("#" + t.id + " " + t.agent + " [" + t.status + "]" + (t.branch ? " " + t.branch : "") + " " + flat(t.task));
+}
+
+// ------------------------------------------------------- audit
+// `fleet audit` joins the fleet's own state (tasks, agent threads,
+// the working list) with the live agents the manager passes in
+// (--live), because the CLI cannot see the platform's agent list.
+// It reports what is in progress, what is stale or stalled, what
+// waits on the manager, and what is unaccounted — with the commands
+// to reconcile each finding. Read-only, unless --fix, which applies
+// only the unambiguous bookkeeping fixes (syncing the working list
+// with the tasks). Judgement calls (done vs stalled) stay with the
+// manager: the audit prescribes, it does not decide.
+
+function ageStr(iso: string | null | undefined): string {
+  if (!iso) return "never";
+  const ms = Date.now() - Date.parse(iso);
+  if (!Number.isFinite(ms) || ms < 60000) return "just now";
+  const min = Math.floor(ms / 60000);
+  if (min < 60) return min + "m ago";
+  const h = Math.floor(min / 60);
+  if (h < 24) return h + "h" + (min % 60 === 0 ? "" : String(min % 60) + "m") + " ago";
+  const d = Math.floor(h / 24);
+  return d + "d" + (h % 24 === 0 ? "" : String(h % 24) + "h") + " ago";
+}
+
+type AuditRow = {
+  agent: string; taskId?: number; branch?: string | null; task?: string | null;
+  status?: TaskStatus; created?: string; updated?: string;
+  lines?: number; lastActivity?: string | null; lastKind?: string | null;
+  lastText?: string | null; live?: boolean | null;
+};
+
+function cmdAudit(root: string, pos: string[], opts: Opts): void {
+  const project = pos[0];
+  if (!project) fail("audit needs a project name");
+  const dir = requireProject(root, project);
+  const mem = loadMemory(dir);
+  const tasks = loadTasks(dir);
+  const threads = agentNames(dir);
+  const liveOpt = optText(opts, "live");
+  const live = liveOpt === undefined ? null : [...new Set(liveOpt.split(",").map((s) => s.trim()).filter(Boolean))];
+  const liveSet = live === null ? null : new Set(live);
+
+  const info = new Map<string, { lines: number; last: Root | null }>();
+  for (const name of threads) {
+    const log = agentLog(dir, name) ?? [];
+    info.set(name, { lines: log.length, last: log.length > 0 ? log[log.length - 1] : null });
+  }
+  const taskByAgent = new Map(tasks.map((t) => [t.agent, t]));
+
+  const rowFor = (t: Task): AuditRow => {
+    const th = info.get(t.agent);
+    return {
+      agent: t.agent, taskId: t.id, branch: t.branch ?? null, task: t.task,
+      status: t.status, created: t.created, updated: t.updated,
+      lines: th?.lines ?? 0, lastActivity: th?.last?.date ?? null,
+      lastKind: th?.last?.kind ?? null,
+      lastText: th?.last ? flat(th.last.text).slice(0, 120) : null,
+      live: liveSet === null ? null : liveSet.has(t.agent),
+    };
+  };
+
+  const inProgress: AuditRow[] = [];
+  const stale: AuditRow[] = [];
+  const waiting: AuditRow[] = [];
+  const blocked: AuditRow[] = [];
+  const doneButLive: AuditRow[] = [];
+  const orphaned: AuditRow[] = [];
+  const tasksWithoutThreads: AuditRow[] = [];
+  const unaccounted: AuditRow[] = [];
+  for (const t of tasks) {
+    const row = rowFor(t);
+    if (!info.has(t.agent)) tasksWithoutThreads.push(row);
+    if (t.status === "working") {
+      if (liveSet !== null && !liveSet.has(t.agent)) stale.push(row);
+      else inProgress.push(row);
+    } else if (t.status === "idle") waiting.push(row);
+    else if (t.status === "blocked") blocked.push(row);
+    else if (t.status === "done" && liveSet !== null && liveSet.has(t.agent)) doneButLive.push(row);
+  }
+  for (const name of threads) {
+    if (taskByAgent.has(name)) continue;
+    const th = info.get(name)!;
+    const row: AuditRow = { agent: name, lines: th.lines, lastActivity: th.last?.date ?? null, live: liveSet === null ? null : liveSet.has(name) };
+    if (liveSet !== null && liveSet.has(name)) unaccounted.push(row);
+    else orphaned.push(row);
+  }
+  if (liveSet !== null) {
+    for (const name of liveSet) {
+      if (!taskByAgent.has(name) && !info.has(name)) unaccounted.push({ agent: name, lines: 0, lastActivity: null, live: true });
+    }
+  }
+
+  // Bookkeeping: the working list should hold exactly the agents with
+  // open tasks (working, idle, or blocked). Anything else drifted.
+  const expectedWork = new Set(tasks.filter((t) => t.status !== "done").map((t) => t.agent));
+  const bookkeeping: Array<{ agent: string; issue: string }> = [];
+  for (const w of mem.work) {
+    if (!expectedWork.has(w)) bookkeeping.push({ agent: w, issue: "in the working list but its task is done (or it has no task)" });
+  }
+  for (const a of expectedWork) {
+    if (!mem.work.includes(a)) bookkeeping.push({ agent: a, issue: "task is open but the agent is missing from the working list" });
+  }
+
+  let fixed: string[] = [];
+  if (opts.fix && bookkeeping.length > 0) {
+    mem.work = tasks.filter((t) => t.status !== "done").map((t) => t.agent);
+    saveView(mem);
+    fixed = bookkeeping.map((b) => b.agent + ": " + b.issue);
+  }
+
+  const counts = {
+    threads: threads.length, tasks: tasks.length,
+    working: tasks.filter((t) => t.status === "working").length,
+    idle: tasks.filter((t) => t.status === "idle").length,
+    done: tasks.filter((t) => t.status === "done").length,
+    blocked: tasks.filter((t) => t.status === "blocked").length,
+    live: live === null ? null : live.length,
+  };
+
+  const actions: string[] = [];
+  for (const r of stale) actions.push(r.agent + ": check whether the work landed — if done and merged, run: fleet report " + project + " " + r.agent + " --text <what landed> --done; if stalled, nudge it (fleet tell " + project + " " + r.agent + " --message <...>) or re-spawn the task.");
+  for (const r of [...waiting, ...blocked]) actions.push(r.agent + " [" + r.status + "]: follow up — fleet tell " + project + " " + r.agent + " --message <next step> (or fleet report " + project + " " + r.agent + " --text <...> --done if the report was final).");
+  for (const r of unaccounted) actions.push(r.agent + ": live but untracked — track it with fleet spawn " + project + " --task <what it is doing> --name " + r.agent + ", or close it if it is not fleet work.");
+  for (const r of doneButLive) actions.push(r.agent + ": task is done but the agent is still live — check what it is doing; give it new work with fleet tell, or close it.");
+  for (const r of tasksWithoutThreads) actions.push(r.agent + ": task #" + r.taskId + " has no agent thread — re-spawn the task, or mark it done if the work landed.");
+  if (bookkeeping.length > 0 && !opts.fix) actions.push("bookkeeping: run fleet audit " + project + " --fix to sync the working list with the tasks.");
+
+  const data = { project, counts, live, inProgress, stale, waiting, blocked, doneButLive, unaccounted, orphaned, tasksWithoutThreads, bookkeeping, fixed, actions };
+  if (opts.json) { outJson(data); return; }
+
+  const activity = (r: AuditRow): string => {
+    if ((r.lines ?? 0) <= 2) return "spawned " + ageStr(r.created) + ", no reports yet";
+    return "last thread activity " + ageStr(r.lastActivity) + " (" + (r.lastKind ?? "?") + ")";
+  };
+  const head = (r: AuditRow): string => "  - " + r.agent + " [" + (r.status ?? "?") + "]" + (r.taskId !== undefined ? " #" + r.taskId : "") + (r.branch ? " " + r.branch : "");
+  const show = (title: string, rows: AuditRow[], extra?: (r: AuditRow) => string): void => {
+    if (rows.length === 0) return;
+    console.log(title + " (" + rows.length + "):");
+    for (const r of rows) console.log(head(r) + (extra ? " — " + extra(r) : "") + (r.task ? " :: " + flat(r.task).slice(0, 100) : ""));
+  };
+
+  console.log("fleet audit: " + project);
+  console.log("tasks: " + counts.tasks + " (" + counts.working + " working, " + counts.idle + " idle, " + counts.done + " done, " + counts.blocked + " blocked); threads: " + counts.threads + (live === null ? "; live agents: not given (pass --live <a,b> to join them)" : "; live: " + live.length));
+  show("in progress", inProgress, activity);
+  show("stale or stalled — no live agent; check each", stale, activity);
+  show("waiting on the manager — agent reported, no follow-up yet", waiting, (r) => "last report " + ageStr(r.updated) + (r.lastText ? ": \"" + r.lastText + "\"" : ""));
+  show("blocked — needs the manager to unblock", blocked, (r) => "last report " + ageStr(r.updated) + (r.lastText ? ": \"" + r.lastText + "\"" : ""));
+  const linesN = (n: number): string => n === 1 ? "1 line" : n + " lines";
+  show("unaccounted — live agent, no fleet task", unaccounted, (r) => (r.lines ?? 0) > 0 ? "thread has " + linesN(r.lines ?? 0) : "no thread");
+  show("done but still live", doneButLive, activity);
+  show("orphaned threads — no task", orphaned, (r) => linesN(r.lines ?? 0) + ", last activity " + ageStr(r.lastActivity));
+  show("tasks without threads", tasksWithoutThreads, () => "agent thread is missing");
+  if (bookkeeping.length > 0) {
+    console.log("bookkeeping (" + bookkeeping.length + "):");
+    for (const b of bookkeeping) console.log("  - " + b.agent + ": " + b.issue);
+  }
+  if (fixed.length > 0) console.log("fixed with --fix: working list now holds " + mem.work.length + " agent(s).");
+  if (actions.length > 0) {
+    console.log("actions:");
+    for (const a of actions) console.log("  - " + a);
+  }
+  if (stale.length + waiting.length + blocked.length + unaccounted.length + doneButLive.length + orphaned.length + tasksWithoutThreads.length + bookkeeping.length === 0) {
+    console.log("clean: every open task has a live agent and nothing waits on the manager" + (live === null ? " (liveness not checked — pass --live)" : "") + ".");
+  }
 }
 
 function cmdCompact(root: string, pos: string[], opts: Opts): void {
@@ -1198,6 +1380,7 @@ function main(argv: string[]): void {
       case "status": cmdStatus(root, pos, opts); return;
       case "agents": cmdAgents(root, pos, opts); return;
       case "tasks": cmdTasks(root, pos, opts); return;
+      case "audit": cmdAudit(root, pos, opts); return;
       case "compact": cmdCompact(root, pos, opts); return;
       case "ready": cmdReady(root, pos, opts); return;
       case "store-node": cmdStoreNode(root, pos, opts); return;

@@ -100,10 +100,11 @@ Add `--json` for machine-readable output.
 | `fleet zoom <project> <id+n\|id\|Name>` | Drill down: open a summary line into its two children, read one message whole (`n = 1`), or read an agent's whole thread (by name). Zoom is the way to navigate history; never grep the log files. |
 | `fleet spawn <project> --task <t> [--name N] [--branch B]` | Start one agent thread per task, in parallel. Returns the agent's name at once. One agent owns one task and one branch. |
 | `fleet tell <project> <name> --message <m>` | Send a message to an agent thread: a follow-up, a correction, new information. |
-| `fleet report <project> <name> --text <t> [--done]` | Inject an agent's report into the global chat as a `[Name]` work message. Use `--done` when the task is finished. |
+| `fleet report <project> <name> --text <t> [--done\|--blocked]` | Inject an agent's report into the global chat as a `[Name]` work message. Use `--done` when the task is finished, `--blocked` when the agent is blocked and needs the manager. |
 | `fleet status <project>` | The manager's dashboard: message count, view size, tree build state, nodes waiting on the LLM, agents, tasks, recent lines. |
 | `fleet agents <project>` | List agent threads with log lengths and status. |
 | `fleet tasks <project>` | List tasks and their status. |
+| `fleet audit <project> [--live <a,b>] [--fix]` | Join fleet tasks with your platform's live agents; report stale, waiting, blocked, and unaccounted work, with the commands to reconcile each. `--fix` applies the bookkeeping fixes. See "Auditing the swarm". |
 | `fleet compact <project>` | After logging a batch of work. Builds nodes whose source fits; logs the rest to the compaction queue for the scheduled compactor (see "Scheduled compaction"). |
 | `fleet ready <project> [--one <id+n>]` | List nodes waiting on scheduled compaction. `--one` prints one node's full compaction task. For the scheduled compactor. |
 | `fleet store-node <project> <id+n> --text <line>` | Store one LLM-written summary line (at most 512 bytes). For the scheduled compactor. |
@@ -123,6 +124,8 @@ You (the manager) own the project. Your loop:
    git worktree before it starts (see "Git worktrees" below).
 3. Check in with `fleet status` and `fleet view`. Read agent reports
    as they land in the global chat; send follow-ups with `fleet tell`.
+   When the user asks for status — on the whole swarm or one task —
+   audit instead of guessing (see "Auditing the swarm" below).
 4. After a batch of activity, run `fleet compact`. It builds what fits
    and logs the rest to the compaction queue; the scheduled compactor
    drains it out of band. Never spawn a compactor inline.
@@ -141,10 +144,11 @@ A spawned agent's loop:
    project is a git repo, your directory is a git worktree on your
    branch — never check out another branch there, and never work in
    the manager's checkout.
-4. When finished (or blocked), `fleet report <project> <YourName>
-   --text <report> [--done]`. The report is your final word: what you
-   did, what you found, what failed. The manager reads it as a `work`
-   message in the global chat.
+4. When finished, `fleet report <project> <YourName> --text <report>
+   --done`; when blocked, the same with `--blocked` instead, so the
+   manager sees it as blocked rather than idle. The report is your
+   final word: what you did, what you found, what failed. The manager
+   reads it as a `work` message in the global chat.
 
 ### Git worktrees
 
@@ -253,6 +257,61 @@ Writing a good summary line (from the compaction prompt):
 - If the CLI says the line is over the limit, rewrite it shorter. Do
   not clip it: there is no truncation path, by design.
 
+### Auditing the swarm
+
+When the user asks how things stand — the whole swarm or one task —
+answer from an audit, never from one source alone. The fleet's tasks
+and your platform's live agents can disagree, and each side alone
+misleads: a task can sit `[working]` long after its agent is gone, and
+an agent can be running work no task tracks. The usual drift: a worker
+reports `--done`, and a later follow-up `tell` re-arms its task to
+`[working]` — the work is merged, the bookkeeping says otherwise. The
+audit joins the two sides and tells you what to reconcile.
+
+Run it as `fleet audit <project> --live <Name1,Name2>`, with the live
+names from your platform's agent list. Name each platform subagent
+after its fleet agent, so the join works. The CLI cannot see your
+platform's agents — without `--live` it reports fleet-side state only,
+and `[working]` tasks all read as "in progress" because liveness is
+unknown.
+
+Findings, and what to do with each:
+
+- **In progress** — task `[working]` + live agent. Nothing to do;
+  this is the healthy state.
+- **Stale or stalled** — task `[working]`, no live agent. Check the
+  work: if it landed (merged, verified), close it with `fleet report
+  <project> <Name> --text <what landed> --done`; if it is genuinely
+  stalled, nudge the agent with `fleet tell` or re-spawn the task.
+- **Waiting** — task `[idle]`: the agent reported progress and waits
+  on you. Follow up with `fleet tell`, or close it with `report
+  --done` if the report was final (including closing it as superseded
+  when the work continues under a re-spawned task — say so in the
+  report text).
+- **Blocked** — task `[blocked]`: the agent reported it is blocked.
+  Unblock it — answer its question, clear the obstacle, or re-scope
+  the task — with `fleet tell`, then it goes back to `[working]`.
+- **Unaccounted** — live agent, no fleet task. Track it with `fleet
+  spawn <project> --task <what it is doing> --name <Name>`, or close
+  the agent if it is not fleet work.
+- **Done but still live** — task `[done]`, agent still running. Check
+  what it is doing: give it new work with `fleet tell`, or close it.
+- **Orphaned threads / tasks without threads** — a thread with no
+  task, or a task whose thread is missing. Re-spawn the task, or mark
+  it done if the work landed.
+- **Bookkeeping** — the working list drifted from the tasks (an agent
+  listed whose task is done, or an open task missing from the list).
+  Run `fleet audit <project> --fix`: it syncs the working list with
+  the tasks, the one fix the CLI applies on its own.
+
+Reconcile — do not just report. Work the audit's action list until the
+swarm matches reality and every open task has a live agent moving it
+toward the goal, then answer the user's status question from the
+reconciled state. An audit that ends in a report with no action is
+unfinished. `--fix` covers bookkeeping only; judgement calls (done vs
+stalled) stay with you, and the audit prescribes the commands for
+them.
+
 ## Rules
 
 - **Never hand-edit** `main/`, `tree/`, `*.index`, `view.json`,
@@ -277,6 +336,11 @@ Writing a good summary line (from the compaction prompt):
   the manager loop; the scheduled task drains the queues every 30 minutes,
   for every open project. Set that task up yourself when you adopt the
   skill; never ask the user to schedule compaction.
+- **Status questions get an audit.** When the user asks how things
+  stand — the whole swarm or one task — run `fleet audit` with the
+  live agent list, reconcile whatever is off, then answer from the
+  reconciled state. Never answer from the fleet state or the live
+  agents alone.
 - **Keep `fleet.ts` a single file.** No dependencies, no build step,
   no imports beyond `node:*`. It must keep running under both Node 22+
   and Bun.
