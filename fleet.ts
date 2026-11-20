@@ -10,6 +10,7 @@
 //     main.index          binary index: 16 bytes per message slot
 //     tree.index          binary index: 16 bytes per tree slot
 //     view.json           materialized view + pick/goal/work
+//     compaction-queue.json logged nodes waiting on the scheduled compactor
 //     agents/<Name>.jsonl one log per agent thread
 //     tasks.json          task queue: owner, branch, status
 //     work/<Name>/        working dir per agent
@@ -20,17 +21,21 @@
 // broad. Zoom opens any line into its children, down to the message.
 // Agents report back into the global chat as [Name] work messages.
 //
-// Compaction is LLM-in-the-loop, and the LLM is the manager (Muse),
-// not an API call inside this CLI. The CLI builds only nodes whose
-// source already fits in NODE bytes. Anything longer goes on a queue:
-//   `fleet compact` builds what fits, then logs one "compaction
-//   needed" note into the global chat for the manager to see.
-//   The manager spawns a compactor agent, which reads each task with
+// Compaction runs out of band, on a schedule. The CLI never calls a
+// model; the LLM is the manager's scheduled compactor task, not an
+// API call inside this CLI. The CLI builds only nodes whose source
+// already fits in NODE bytes. Anything longer goes on a queue:
+//   `fleet compact` builds what fits, then logs what still needs the
+//   LLM to `compaction-queue.json` in the project dir.
+//   Every 30 minutes a scheduled compactor task reads the queue back
+//   and drains it: it reads each task with
 //   `fleet ready <project> --one <id+n>` and stores its line with
 //   `fleet store-node <project> <id+n> --text <line>`.
 // Storing a node can unblock its parent, which may then fit or need
 // the LLM in turn. There is no truncation fallback: every summary
 // line is written by the LLM through `store-node`.
+// The manager never blocks on compaction and never spawns a compactor
+// inline; see SKILL.md ("Scheduled compaction").
 //
 // Run with Node 22+ (default) or Bun:
 //   node fleet.ts help
@@ -40,9 +45,9 @@
 //   node fleet.ts status demo
 //   node fleet.ts view demo
 //   node fleet.ts zoom demo 0+4
-//   node fleet.ts compact demo            (builds what fits, requests LLM help if needed)
-//   node fleet.ts ready demo --one 6+1    (agent reads one compaction task)
-//   node fleet.ts store-node demo 6+1 --text "one-line summary"  (agent stores it)
+//   node fleet.ts compact demo            (builds what fits, logs the rest to the queue)
+//   node fleet.ts ready demo --one 6+1    (scheduled compactor reads one task)
+//   node fleet.ts store-node demo 6+1 --text "one-line summary"  (compactor stores it)
 //
 // Root: --root <dir> wins, else $FLEET_ROOT, else the dir holding this
 // file. Projects are subdirectories of the root.
@@ -87,7 +92,7 @@ const SLOT = 16;
 const DAY = 864e5;
 const CAP = 30000;
 const WAIT = "(not summarized yet: zoom it)";
-const VERSION = "fleet 0.2.2 (UniiChat-memory port, LLM-in-the-loop compaction)";
+const VERSION = "fleet 0.3.0 (UniiChat-memory port, scheduled out-of-band compaction)";
 
 // ------------------------------------------------------------- names
 // Agent names: adjective + noun, e.g. FireAnt. Port of Names.ts.
@@ -473,11 +478,12 @@ function readyNodes(mem: Memory): Part[] {
 
 // ------------------------------------------------------- compaction
 // The CLI never calls a model. It builds only nodes whose source fits
-// in NODE bytes. Longer ready nodes wait for the manager's compactor
-// agent, which reads them via `ready` and stores lines via `store-node`
-// (see the commands below). There is no truncation path.
+// in NODE bytes. Longer ready nodes are logged to compaction-queue.json
+// and wait for the scheduled compactor task, which reads them via
+// `ready` and stores lines via `store-node` (see the commands below).
+// There is no truncation path.
 
-const COMPACTION_PREFIX = "compaction needed:";
+const QUEUE_FILE = "compaction-queue.json";
 const SCALE = "-".repeat(NODE);
 
 // Build every ready node whose source fits, level by level, until no
@@ -515,21 +521,31 @@ function nodesNeedingLLM(mem: Memory): Array<Part & { source: string; size: numb
   return out;
 }
 
-// Log one compaction request into the global chat for the manager to
-// see. Deduped: if the last message is already such a request, log
-// nothing, so repeated `compact` runs cannot spam the chat. The
-// request itself is short, so it builds immediately and adds no new
-// LLM work. Returns true if a request was logged.
-function logCompactionRequest(mem: Memory, project: string, need: Array<Part & { size: number }>): boolean {
-  const last = mem.count > 0 ? messageAt(mem, mem.count - 1) : null;
-  if (last !== null && last.kind === "note" && last.text.startsWith(COMPACTION_PREFIX)) return false;
-  const refs = need.slice(0, 10).map((p) => ref(p)).join(", ");
-  const more = need.length > 10 ? " (+" + (need.length - 10) + " more)" : "";
-  const text = COMPACTION_PREFIX + " " + need.length + " node(s) ready for LLM compaction: " + refs + more +
-    ". Manager: spawn a compactor agent. It reads each task with `fleet ready " + project + " --one <id+n>` " +
-    "and stores its line (at most " + NODE + " bytes) with `fleet store-node " + project + " <id+n> --text <line>`.";
-  pushMessages(mem, [{ kind: "note", text }]);
-  return true;
+// The compaction queue: the out-of-band handoff between `compact` and
+// the scheduled compactor task. `compact` (and `store-node`) rewrite
+// the whole file with the current pending set, so it never goes stale
+// with stored refs; the scheduled task drains the live queue via
+// `ready`, which derives the same set from the tree. When nothing
+// needs the LLM the file records an empty queue with a fresh
+// timestamp, so a scheduled run can see the project is clean.
+type QueueEntry = { ref: string; l: number; i: number; bytes: number };
+type CompactionQueue = { project: string; updated: string; count: number; nodes: QueueEntry[] };
+
+function queueFile(dir: string): string { return dir + "/" + QUEUE_FILE; }
+
+function writeCompactionQueue(mem: Memory, project: string, need: Array<Part & { size: number }>): CompactionQueue {
+  const queue: CompactionQueue = {
+    project,
+    updated: new Date().toISOString(),
+    count: need.length,
+    nodes: need.map((p) => ({ ref: ref(p), l: p.l, i: p.i, bytes: p.size })),
+  };
+  atomicWrite(queueFile(mem.dir), JSON.stringify(queue, null, 2) + "\n");
+  return queue;
+}
+
+function readCompactionQueue(dir: string): CompactionQueue | null {
+  return readJsonFile<CompactionQueue | null>(queueFile(dir), null);
 }
 
 // The compaction task for one node, in UniiChat's LEAF/MERGE shape:
@@ -854,9 +870,9 @@ Usage: fleet <command> [args] [--root <dir>] [--json]
   status <project>                      counts, view size, agents, tasks, recent lines
   agents <project>                      list agent threads with log lengths
   tasks <project>                       list tasks
-  compact <project>                     build nodes whose source fits; if more need
-                                        the LLM, log one request note for the manager
-  ready <project> [--one <id+n>]        list nodes waiting on LLM compaction
+  compact <project>                     build nodes whose source fits; log the rest
+                                        to compaction-queue.json for the scheduled compactor
+  ready <project> [--one <id+n>]        list nodes waiting on scheduled compaction
   store-node <project> <id+n> --text <t> store one LLM-written summary line (<=512 B)
   tree <project>                        print the tree by level
   help                                  this help
@@ -865,12 +881,12 @@ Kinds: user, manager, work, unii, tool, echo, note.
 Text can come from --text / --message / --task, trailing words, --file, or stdin.
 Root: --root, else $FLEET_ROOT, else the dir holding fleet.ts.
 
-Compaction loop (the LLM is the manager, not this CLI):
-  1. fleet compact <project>   builds what fits, logs a request if more need the LLM
-  2. manager spawns a compactor agent for the queued refs
-  3. agent runs: fleet ready <project> --one <id+n>   (reads the task)
-  4. agent runs: fleet store-node <project> <id+n> --text <line>
-  5. agent repeats until the queue is empty, then reports back
+Scheduled compaction (out of band; the LLM is the scheduled task, not this CLI):
+  1. fleet compact <project>   builds what fits, logs the rest to compaction-queue.json
+  2. every 30 minutes the scheduled compactor task runs (see SKILL.md)
+  3. it runs: fleet ready <project> --one <id+n>   (reads one task)
+  4. it runs: fleet store-node <project> <id+n> --text <line>
+  5. it repeats until the queue is empty, then re-runs fleet compact
 `;
 
 // --------------------------------------------------------- commands
@@ -1010,11 +1026,13 @@ function cmdStatus(root: string, pos: string[], opts: Opts): void {
   });
   const recent = viewLines(mem).slice(-8);
   const need = nodesNeedingLLM(mem);
+  const queue = readCompactionQueue(dir);
   const data = {
     project, dir, count: mem.count, open: mem.open,
     viewBytes: mem.view.size, viewLines: mem.view.parts.length,
     treeBuilt: tree.built, treeTotal: tree.total, treeUnbuilt: tree.unbuilt,
     needsLLM: need.length, readyRefs: need.map((p) => ref(p)),
+    queue,
     agents, tasks,
     working: mem.work,
     goal: mem.goal, pick: mem.pick,
@@ -1024,7 +1042,8 @@ function cmdStatus(root: string, pos: string[], opts: Opts): void {
   console.log("fleet status: " + project + " (" + dir + ")");
   console.log("messages: " + mem.count + " (open pages: " + mem.open + "), view: " + mem.view.parts.length + " lines, " + mem.view.size + " bytes");
   console.log("tree: " + tree.built + "/" + tree.total + " nodes built, " + tree.unbuilt + " unbuilt");
-  if (need.length > 0) console.log("compaction needed: " + need.length + " node(s) waiting on the LLM: " + need.map((p) => ref(p)).slice(0, 5).join(", ") + " (run: fleet ready " + project + ")");
+  if (need.length > 0) console.log("compaction needed: " + need.length + " node(s) waiting: " + need.map((p) => ref(p)).slice(0, 5).join(", ") + " (queued in " + QUEUE_FILE + "; the scheduled compactor drains them)");
+  else if (queue !== null) console.log("compaction queue: empty (last logged " + queue.updated + ")");
   if (mem.goal) console.log("goal: " + mem.goal);
   console.log("agents (" + agents.length + "):");
   for (const a of agents) console.log("  - " + a.name + " [" + a.status + "] " + a.lines + " lines" + (a.branch ? " branch " + a.branch : "") + (a.task ? " :: " + flat(a.task).slice(0, 100) : ""));
@@ -1069,26 +1088,23 @@ function cmdCompact(root: string, pos: string[], opts: Opts): void {
   const dir = requireProject(root, project);
   const mem = loadMemory(dir);
   const before = countBuilt(mem);
-  if (opts.naive || opts.native) fail("--naive was removed: compaction is LLM-in-the-loop only. Run fleet compact " + project + " to queue nodes, then have a compactor agent store lines with fleet store-node.");
+  if (opts.naive || opts.native) fail("--naive was removed: compaction is scheduled out-of-band only. Run fleet compact " + project + " to queue nodes; the scheduled compactor stores lines with fleet store-node.");
   const made = compactFitting(mem);
   const need = nodesNeedingLLM(mem);
-  const requested = need.length > 0 ? logCompactionRequest(mem, project, need) : false;
+  const queue = writeCompactionQueue(mem, project, need);
   const after = countBuilt(mem);
   const refs = need.map((p) => ref(p));
   if (opts.json) {
-    outJson({ project, mode: "llm", made, before, after, count: mem.count, needsLLM: need.length, refs, requested });
+    outJson({ project, mode: "llm", made, before, after, count: mem.count, needsLLM: need.length, refs, queueFile: QUEUE_FILE, queueUpdated: queue.updated });
     return;
   }
   console.log("compacted " + made + " fitting nodes (" + before.built + "/" + before.total + " -> " + after.built + "/" + after.total + " built)");
   if (need.length === 0) {
-    console.log("no nodes need the LLM.");
+    console.log("no nodes need the LLM. Queue is empty (logged to " + QUEUE_FILE + ").");
     return;
   }
   console.log("needs LLM: " + need.length + " node(s): " + refs.slice(0, 10).join(", ") + (refs.length > 10 ? " (+" + (refs.length - 10) + " more)" : ""));
-  console.log(requested
-    ? "logged a compaction request note into the global chat for the manager."
-    : "a compaction request is already the last message; not logging another.");
-  console.log("agent next step: fleet ready " + project + " --one " + refs[0]);
+  console.log("logged to " + QUEUE_FILE + " for the scheduled compactor (every 30 minutes).");
 }
 
 function cmdReady(root: string, pos: string[], opts: Opts): void {
@@ -1142,7 +1158,9 @@ function cmdStoreNode(root: string, pos: string[], opts: Opts): void {
   fit(mem);
   saveView(mem);
   const after = countBuilt(mem);
-  const still = nodesNeedingLLM(mem).length;
+  const stillNeed = nodesNeedingLLM(mem);
+  writeCompactionQueue(mem, project, stillNeed);
+  const still = stillNeed.length;
   if (opts.json) outJson({ project, ref: target, bytes: size, unblockedParents: unblocked, built: after.built, total: after.total, stillNeedingLLM: still });
   else console.log("stored " + target + " (" + size + " bytes)" + (unblocked > 0 ? ", unblocked " + unblocked + " fitting parent(s)" : "") + ". Tree: " + after.built + "/" + after.total + " built, " + still + " still needing the LLM.");
 }

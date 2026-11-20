@@ -4,12 +4,12 @@ description: >-
   Coordinate a fleet of coding agents with shared, durable memory using
   the fleet.ts CLI: one never-ending global chat per project, a binary
   summary tree with view and zoom for navigating history, one thread and
-  work directory per agent, and LLM-in-the-loop compaction. Use when two
+  work directory per agent, and scheduled out-of-band compaction. Use when two
   or more agents work on shared tasks, when project history must survive
   across sessions, or when a manager needs progress reports on demand.
 compatibility: Requires Node.js 22+ (or Bun) to run fleet.ts. No dependencies, no build step, no network access.
 metadata:
-  version: "0.2.2"
+  version: "0.3.0"
   author: jacob-test-profile
 ---
 
@@ -18,8 +18,8 @@ metadata:
 Coordinate a fleet of coding agents with shared, durable memory. One
 never-ending global chat per project, compressed into a binary summary
 tree, plus one thread per agent. The tool is `fleet.ts`, a single-file
-CLI in this skill's directory. It never calls a model: you are the LLM,
-and compaction is LLM-in-the-loop (see "Compaction" below).
+CLI in this skill's directory. It never calls a model: compaction runs
+out of band, on a schedule (see "Scheduled compaction" below).
 
 ## When to use this skill
 
@@ -77,16 +77,18 @@ and work dirs.
 You (the manager) own the project:
 
 1. `fleet.ts init <project>` once; `fleet.ts log` the plan and
-   decisions.
+   decisions. Schedule the project's recurring compaction task (see
+   "Scheduled compaction" below) — once per project.
 2. Split the work and `fleet.ts spawn` one agent per task, each with
    its own branch. `spawn` returns the agent's name at once.
 3. Check in with `fleet.ts status` and `fleet.ts view`. Read agent
    reports as they land in the global chat; send follow-ups with
    `fleet.ts tell`.
-4. After a batch of activity, run `fleet.ts compact`. If it logs a
-   compaction request, spawn a compactor agent (below).
-5. When all tasks report `--done` and `fleet.ts compact` reports no
-   nodes need the LLM, the project is clean.
+4. After a batch of activity, run `fleet.ts compact`. It builds what
+   fits and logs the rest to the compaction queue; the scheduled
+   compactor drains it out of band. Never spawn a compactor inline.
+5. When all tasks report `--done` and `fleet.ts status` shows the
+   compaction queue empty, the project is clean.
 
 ## Worker agent loop
 
@@ -103,28 +105,53 @@ A spawned agent's loop:
    did, what you found, what failed. The manager reads it as a `work`
    message in the global chat.
 
-## Compaction loop
+## Scheduled compaction
 
-The CLI never writes summaries itself and never calls a model. The LLM
-(you, or a compactor agent you spawn) writes every summary line:
+Compaction runs out of band, on a schedule — never in the manager's
+loop. The CLI never writes summaries itself and never calls a model.
+The LLM (your scheduled compactor task) writes every summary line.
+
+How it works:
 
 1. `fleet.ts compact <project>` builds every node whose source already
-   fits in 512 bytes. For the rest, it logs exactly one note into the
-   global chat: `compaction needed: N node(s)...`, listing the refs.
-   Repeated runs do not log again while that note is the last message.
-2. The manager spawns a compactor agent for the queued refs.
-3. The compactor reads one task with `fleet.ts ready <project> --one
-   <id+n>`. The output is the full compaction prompt: the ruler, the
-   rules, recent view context, and the source to compress.
-4. The agent writes one line and stores it: `fleet.ts store-node
-   <project> <id+n> --text <line>`. The CLI validates it: the node must
-   exist and be ready, its halves must be built, and the line must be
-   non-empty and at most 512 bytes. Storing a node can unblock its
-   parent, which may then fit (built automatically) or need the LLM in
-   turn.
-5. The agent repeats steps 3-4 until `fleet.ts ready` is empty, then
-   reports back with `fleet.ts report ... --done`. The manager re-runs
-   `fleet.ts compact` to confirm the tree is clean.
+   fits in 512 bytes, and logs the rest to `compaction-queue.json` in
+   the project directory: the pending refs, their levels, and sizes,
+   with a timestamp. It logs nothing into the global chat, and the
+   manager does nothing further.
+2. Once per project, schedule a recurring task every 30 minutes to
+   drain the queue (below). Scheduling is platform-specific: use
+   whatever scheduled/recurring task feature your environment offers.
+   The task runs on its own; the manager never blocks on compaction
+   and never spawns a compactor inline.
+3. Each run of the scheduled task:
+   - Run `fleet.ts compact <project>` to refresh the queue.
+   - While `fleet.ts ready <project>` lists nodes, take one with
+     `fleet.ts ready <project> --one <id+n>`. The output is the full
+     compaction prompt: the ruler, the rules, recent view context, and
+     the source to compress.
+   - Write one line and store it: `fleet.ts store-node <project>
+     <id+n> --text <line>`. The CLI validates it: the node must exist
+     and be ready, its halves must be built, and the line must be
+     non-empty and at most 512 bytes. Storing a node can unblock its
+     parent, which may then fit (built automatically) or need the LLM
+     in turn. Each store refreshes `compaction-queue.json`.
+   - Repeat until `fleet.ts ready` is empty, then run `fleet.ts
+     compact <project>` once more to confirm the tree is clean and log
+     the empty queue.
+   - If the queue is empty, exit quietly: no report, no message in
+     the global chat. Compaction leaves no trace in the chat.
+4. `fleet.ts status <project>` shows the queue state: how many nodes
+   are waiting and when the queue was last logged.
+
+Task text to schedule (one per project, every 30 minutes):
+
+> Drain the fleet compaction queue for project `<project>`: run
+> `fleet.ts compact <project>`, then while `fleet.ts ready <project>`
+> lists nodes, compact each with `fleet.ts ready <project> --one
+> <id+n>` and `fleet.ts store-node <project> <id+n> --text <line>`
+> (one line, at most 512 bytes), until `fleet.ts ready` is empty.
+> Finish with `fleet.ts compact <project>` to confirm. If nothing is
+> pending, exit quietly.
 
 Writing a good summary line: output only the line, without an `id+n|`
 head. One line: no newlines. Keep user words closest to verbatim; then
@@ -149,15 +176,16 @@ clip it: there is no truncation path, by design.
 | `fleet.ts status <project>` | The manager's dashboard: messages, view size, tree state, nodes waiting on the LLM, agents, tasks, recent lines. |
 | `fleet.ts agents <project>` | List agent threads with log lengths and status. |
 | `fleet.ts tasks <project>` | List tasks and their status. |
-| `fleet.ts compact <project>` | After logging a batch of work. Builds nodes whose source fits; if more need the LLM, logs one request note. |
-| `fleet.ts ready <project> [--one <id+n>]` | List nodes waiting on LLM compaction. `--one` prints one node's full task. |
-| `fleet.ts store-node <project> <id+n> --text <line>` | Store one LLM-written summary line (at most 512 bytes). |
+| `fleet.ts compact <project>` | After logging a batch of work. Builds nodes whose source fits; logs the rest to the compaction queue for the scheduled compactor. |
+| `fleet.ts ready <project> [--one <id+n>]` | List nodes waiting on scheduled compaction. `--one` prints one node's full task. |
+| `fleet.ts store-node <project> <id+n> --text <line>` | Store one LLM-written summary line (at most 512 bytes). For the scheduled compactor. |
 | `fleet.ts tree <project>` | Print the view, then the tree level by level. For debugging the tree. |
 
 ## Rules
 
 - Never hand-edit `main/`, `tree/`, `*.index`, `view.json`,
-  `agents/*.jsonl`, or `tasks.json`. Every write goes through the CLI.
+  `compaction-queue.json`, `agents/*.jsonl`, or `tasks.json`. Every
+  write goes through the CLI.
 - Never grep the logs for history. Read `fleet.ts view`, then
   `fleet.ts zoom` to the detail you need.
 - Append-only. Correct a mistake with a new message, not by rewriting
@@ -167,8 +195,10 @@ clip it: there is no truncation path, by design.
 - Reports are the interface. A finished task without a report is
   unfinished.
 - No truncation, no model calls in the CLI. If a summary line does not
-  fit, rewrite it. If a node needs intelligence, it waits for the LLM
-  loop.
+  fit, rewrite it. If a node needs intelligence, it waits for the
+  scheduled compactor.
+- Compaction is out of band. Never spawn a compactor agent from the
+  manager loop; the scheduled task drains the queue every 30 minutes.
 - Keep `fleet.ts` a single file. No dependencies, no build step, no
   imports beyond `node:*`. It must keep running under both Node 22+
   and Bun.

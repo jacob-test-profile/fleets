@@ -17,9 +17,9 @@ messages at full detail and older ones in broader merged lines, so the
 whole history stays readable at any size.
 
 The CLI never calls a model. When a summary needs real compression, it
-asks the manager's LLM to write it, through a compactor agent. There is
-no truncation fallback: a line either fits in 512 bytes or gets
-rewritten by the LLM.
+logs the node to the compaction queue, and a scheduled compactor task
+writes the line out of band, every 30 minutes. There is no truncation
+fallback: a line either fits in 512 bytes or gets rewritten by the LLM.
 
 ## Requirements
 
@@ -52,8 +52,8 @@ cp -r fleets .agents/skills/fleets
 ```
 
 Agents using the skill get the full workflow: when to use it, the
-manager/worker/compactor loops, and the rules. See `SKILL.md`, and
-`AGENTS.md` for the full reference.
+manager/worker loops, scheduled compaction, and the rules. See
+`SKILL.md`, and `AGENTS.md` for the full reference.
 
 ## Quick start
 
@@ -85,6 +85,7 @@ demo/
   main.index            binary index: 16 bytes per message slot
   tree.index            binary index: 16 bytes per tree slot
   view.json             materialized view
+  compaction-queue.json logged nodes waiting on the scheduled compactor
   agents/<Name>.jsonl   one log per agent thread
   tasks.json            task queue: owner, branch, status
   work/<Name>/          working dir per agent
@@ -95,8 +96,8 @@ node `(l,i)` merges its two children. The view covers the chat to its
 end with the most detail on the newest messages. Nodes are addressed as
 `id+n`: the `n` messages from `id` on (`0+4` covers messages 0-3).
 `compact` builds every node whose source already fits; for the rest it
-logs one `compaction needed` note into the global chat, and a compactor
-agent writes the lines with `ready --one` and `store-node`.
+logs the refs to `compaction-queue.json`, and a scheduled compactor task
+drains the queue out of band with `ready --one` and `store-node`.
 
 By default projects live next to `fleet.ts` (override with `--root` or
 `$FLEET_ROOT`). They are per-machine runtime state and are git-ignored.
@@ -114,7 +115,7 @@ By default projects live next to `fleet.ts` (override with `--root` or
 | `report <project> <name> --text <t> [--done]` | Inject an agent's report into the global chat |
 | `status <project>` | Manager's dashboard |
 | `agents <project>` / `tasks <project>` | List threads / tasks |
-| `compact <project>` | Build fitting nodes; request LLM help for the rest |
+| `compact <project>` | Build fitting nodes; log the rest to the compaction queue |
 | `ready <project> [--one <id+n>]` | List / read compaction tasks |
 | `store-node <project> <id+n> --text <line>` | Store one LLM-written summary line |
 | `tree <project>` | Print the view, then the tree level by level |
@@ -124,7 +125,7 @@ and text can come from `--text`, trailing words, `--file`, or stdin.
 
 ## Files
 
-- `fleet.ts` — the CLI. One file, ~1,190 lines, no dependencies.
+- `fleet.ts` — the CLI. One file, ~1,210 lines, no dependencies.
 - `SKILL.md` — the Agent Skill definition: frontmatter plus the
   workflow agents follow when the skill is active.
 - `AGENTS.md` — the full reference for agents working in this repo.
