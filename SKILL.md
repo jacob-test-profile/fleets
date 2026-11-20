@@ -127,7 +127,7 @@ How it works:
    the project directory: the pending refs, their levels, and sizes,
    with a timestamp. It logs nothing into the global chat, and the
    manager does nothing further.
-2. One generic scheduled task runs every hour and drains the queue for
+2. One generic scheduled task runs every 30 minutes and drains the queue for
    every open project it finds (a subdirectory holding a fleet project).
    Scheduling is platform-specific: use whatever scheduled/recurring task
    feature your environment offers. The task runs on its own; the manager
@@ -153,7 +153,7 @@ How it works:
 4. `fleet.ts status <project>` shows the queue state: how many nodes
    are waiting and when the queue was last logged.
 
-Task text to schedule (one generic task, every hour, over all open projects):
+Task text to schedule (one generic task, every 30 minutes, over all open projects):
 
 > Drain the fleet compaction queues for every open fleet project: for
 > each project in turn, run `fleet.ts compact <project>`, then while
@@ -211,7 +211,7 @@ clip it: there is no truncation path, by design.
   fit, rewrite it. If a node needs intelligence, it waits for the
   scheduled compactor.
 - Compaction is out of band. Never spawn a compactor agent from the
-  manager loop; the scheduled task drains the queues every hour, for
+  manager loop; the scheduled task drains the queues every 30 minutes, for
   every open project.
 - Keep `fleet.ts` a single file. No dependencies, no build step, no
   imports beyond `node:*`. It must keep running under both Node 22+

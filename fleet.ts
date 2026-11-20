@@ -27,7 +27,7 @@
 // already fits in NODE bytes. Anything longer goes on a queue:
 //   `fleet compact` builds what fits, then logs what still needs the
 //   LLM to `compaction-queue.json` in the project dir.
-//   Every hour a single generic scheduled compactor task reads the
+//   Every 30 minutes a single generic scheduled compactor task reads the
 //   queues back for every open project and drains them: it reads each
 //   task with
 //   `fleet ready <project> --one <id+n>` and stores its line with
@@ -884,7 +884,7 @@ Root: --root, else $FLEET_ROOT, else the dir holding fleet.ts.
 
 Scheduled compaction (out of band; the LLM is the scheduled task, not this CLI):
   1. fleet compact <project>   builds what fits, logs the rest to compaction-queue.json
-  2. every hour the single generic scheduled compactor task runs over every open project (see SKILL.md)
+  2. every 30 minutes the single generic scheduled compactor task runs over every open project (see SKILL.md)
   3. it runs: fleet ready <project> --one <id+n>   (reads one task)
   4. it runs: fleet store-node <project> <id+n> --text <line>
   5. it repeats until the queue is empty, then re-runs fleet compact
@@ -1105,7 +1105,7 @@ function cmdCompact(root: string, pos: string[], opts: Opts): void {
     return;
   }
   console.log("needs LLM: " + need.length + " node(s): " + refs.slice(0, 10).join(", ") + (refs.length > 10 ? " (+" + (refs.length - 10) + " more)" : ""));
-  console.log("logged to " + QUEUE_FILE + " for the scheduled compactor (drained hourly by the generic task).");
+  console.log("logged to " + QUEUE_FILE + " for the scheduled compactor (drained every 30 minutes by the generic task).");
 }
 
 function cmdReady(root: string, pos: string[], opts: Opts): void {

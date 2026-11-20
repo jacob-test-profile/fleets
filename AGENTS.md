@@ -178,7 +178,7 @@ The loop:
    levels, and sizes, with a timestamp, to `compaction-queue.json` in
    the project directory. It logs nothing into the global chat, and
    the manager does nothing further.
-2. One generic scheduled task runs every hour and drains the queue for
+2. One generic scheduled task runs every 30 minutes and drains the queue for
    every open project it finds (a subdirectory holding a fleet project).
    Scheduling is platform-specific: use whatever scheduled/recurring
    task feature your environment offers. New projects are covered
@@ -247,7 +247,7 @@ Writing a good summary line (from the compaction prompt):
   scheduled compactor. Do not add a truncation fallback or a model API
   call to `fleet.ts`.
 - **Compaction is out of band.** Never spawn a compactor agent from
-  the manager loop; the scheduled task drains the queues every hour,
+  the manager loop; the scheduled task drains the queues every 30 minutes,
   for every open project.
 - **Keep `fleet.ts` a single file.** No dependencies, no build step,
   no imports beyond `node:*`. It must keep running under both Node 22+
@@ -266,7 +266,7 @@ node fleet.ts view demo
 node fleet.ts report demo RedFox --text "Fixed redirect, added test, all green." --done
 node fleet.ts compact demo
 # compact logs what still needs the LLM to compaction-queue.json.
-# The generic scheduled compactor task (every hour, every open project) drains it:
+# The generic scheduled compactor task (every 30 minutes, every open project) drains it:
 node fleet.ts ready demo --one 6+1
 node fleet.ts store-node demo 6+1 --text "user: password reset emails carry a token expiring after one hour."
 node fleet.ts compact demo
